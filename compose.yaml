@@ -1,0 +1,18 @@
+services:
+  listen-together:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      MUSIC_PROVIDER: netease
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?请配置 PUBLIC_ORIGIN}
+      CREDENTIAL_KEY: ${CREDENTIAL_KEY:?请配置 CREDENTIAL_KEY}
+      SESSION_SECRET: ${SESSION_SECRET:?请配置 SESSION_SECRET}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    volumes:
+      - listen-data:/app/data
+    restart: unless-stopped
+volumes:
+  listen-data:
