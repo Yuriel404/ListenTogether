@@ -1,6 +1,6 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomBytes, randomInt, randomUUID } from 'node:crypto'
 import type { ChatMessage, PlayerCommand, RoomSnapshot, StreamInfo, Track } from '../shared/types.js'
-import { playbackPosition } from '../shared/types.js'
+import { playbackModes, playbackPosition } from '../shared/types.js'
 import { AppError, publicError } from './errors.js'
 import { accountStatus, type AccountInfo, type MusicProvider } from './music.js'
 import { checkPassword, hashPassword, Repository, type Session, type StoredRoom } from './repository.js'
@@ -13,9 +13,11 @@ export class RoomService {
   private pending = new Map<string, Promise<void>>()
   private streams = new Map<string, StreamInfo>()
   private advancing = new Set<string>()
+  private shuffleOrders = new Map<string, { queueIds: string[]; history: string[]; cursor: number }>()
 
   constructor(readonly repo: Repository, readonly music: MusicProvider) {
     for (const room of repo.loadRooms()) {
+      if (!playbackModes.includes(room.playbackMode)) room.playbackMode = 'sequence'
       // 重启后等待房主重新开始，避免无在线浏览器时自行消耗播放队列。
       room.playback.position = playbackPosition(room.playback, Date.now(), this.duration(room))
       room.playback.playing = false
@@ -65,7 +67,7 @@ export class RoomService {
       id: room.id, name: room.name, createdAt: room.createdAt,
       members: this.repo.members(roomId).map((m) => ({ id: m.id, nickname: m.nickname, role: m.sessionId === room.ownerSessionId ? 'owner' : 'member', online: !!this.online.get(roomId)?.get(m.sessionId) })),
       queue: room.queue.map((item) => ({ ...item, track: { ...item.track, artists: [...item.track.artists] } })),
-      playback: { ...room.playback }, account: { ...room.account }, serverTime: now,
+      playback: { ...room.playback }, playbackMode: room.playbackMode, account: { ...room.account }, serverTime: now,
     }
   }
 
@@ -81,7 +83,7 @@ export class RoomService {
     const now = Date.now()
     const room: StoredRoom = {
       id: randomBytes(9).toString('base64url'), ownerSessionId: session.id, name, createdAt: now,
-      queue: [], playback: { queueId: null, playing: false, position: 0, updatedAt: now, revision: 0 },
+      queue: [], playback: { queueId: null, playing: false, position: 0, updatedAt: now, revision: 0 }, playbackMode: 'sequence',
       account: { connected: false, mode: this.music.mode }, passwordHash: hashPassword(password),
     }
     this.rooms.set(room.id, room)
@@ -186,16 +188,75 @@ export class RoomService {
     })
   }
 
-  private async select(room: StoredRoom, index: number): Promise<void> {
+  private async select(room: StoredRoom, index: number, randomCursor?: number): Promise<void> {
     const item = room.queue[index]
     if (!item) throw new AppError(400, '播放队列为空')
     await this.resolveStream(room, item.track)
     room.playback = { queueId: item.id, playing: true, position: 0, updatedAt: Date.now() + 350, revision: room.playback.revision + 1 }
+    if (room.playbackMode === 'random') {
+      const order = this.shuffleOrders.get(room.id)
+      if (randomCursor === undefined || !order) this.shuffleOrders.delete(room.id)
+      else {
+        order.cursor = randomCursor
+        // 只保留最近的播放历史及当前随机轮次，防止长期播放无限增长。
+        if (order.cursor > 400) {
+          const removed = order.cursor - 200
+          order.history.splice(0, removed)
+          order.cursor -= removed
+        }
+      }
+    }
+  }
+
+  private shuffled(ids: string[]): string[] {
+    ids = [...ids]
+    for (let i = ids.length - 1; i > 0; i--) {
+      const j = randomInt(i + 1)
+      ;[ids[i], ids[j]] = [ids[j], ids[i]]
+    }
+    return ids
+  }
+
+  private adjacent(room: StoredRoom, direction: 1 | -1): { index: number; cursor?: number } {
+    const index = room.queue.findIndex((item) => item.id === room.playback.queueId)
+    if (room.playbackMode !== 'random') return { index: index < 0 ? 0 : (index + direction + room.queue.length) % room.queue.length }
+    const ids = room.queue.map((item) => item.id), currentId = index < 0 ? null : room.playback.queueId
+    let order = this.shuffleOrders.get(room.id)
+    if (!order || order.queueIds.length !== ids.length || !ids.every((id) => order!.queueIds.includes(id)) || (order.history[order.cursor] || null) !== currentId) {
+      const remaining = this.shuffled(ids.filter((id) => id !== currentId))
+      order = { queueIds: ids, history: currentId ? [currentId, ...remaining] : remaining, cursor: currentId ? 0 : -1 }
+      this.shuffleOrders.set(room.id, order)
+    }
+    let cursor = order.cursor + direction
+    if (cursor >= order.history.length) {
+      const round = this.shuffled(ids)
+      if (round.length > 1 && round[0] === currentId) {
+        const swap = randomInt(1, round.length)
+        ;[round[0], round[swap]] = [round[swap], round[0]]
+      }
+      order.history.push(...round)
+    }
+    if (order.cursor < 0) cursor = 0
+    else if (cursor < 0) cursor = order.history.length - 1
+    return { index: room.queue.findIndex((item) => item.id === order!.history[cursor]), cursor }
+  }
+
+  private async advance(room: StoredRoom, direction: 1 | -1): Promise<void> {
+    const next = this.adjacent(room, direction)
+    await this.select(room, next.index, next.cursor)
   }
 
   command(roomId: string, session: Session, command: PlayerCommand): Promise<RoomSnapshot> {
     return this.serial(roomId, async () => {
-      const room = this.owner(roomId, session)
+      const room = command.type === 'play' || command.type === 'pause' ? this.owner(roomId, session) : this.member(roomId, session)
+      if (command.type === 'mode') {
+        if (!command.mode || !playbackModes.includes(command.mode)) throw new AppError(400, '请选择有效的播放方式')
+        room.playbackMode = command.mode
+        this.shuffleOrders.delete(room.id)
+        // 修改播放方式不更改当前播放基准，避免让客户端重新跳转或暂停。
+        return this.changed(room)
+      }
+      if (!room.account.connected) throw new AppError(400, '请先让房主连接网易云账号')
       const index = room.queue.findIndex((item) => item.id === room.playback.queueId)
       if (command.type === 'select') {
         const target = room.queue.findIndex((item) => item.id === command.queueId)
@@ -203,10 +264,9 @@ export class RoomService {
         await this.select(room, target)
       } else if (command.type === 'next' || command.type === 'previous') {
         if (!room.queue.length) throw new AppError(400, '请先添加歌曲')
-        const next = index < 0 ? 0 : (index + (command.type === 'next' ? 1 : -1) + room.queue.length) % room.queue.length
-        await this.select(room, next)
+        await this.advance(room, command.type === 'next' ? 1 : -1)
       } else if (command.type === 'play' && index < 0) {
-        await this.select(room, 0)
+        await this.advance(room, 1)
       } else {
         const item = room.queue[index]
         if (!item) throw new AppError(400, '请先选择歌曲')
@@ -237,6 +297,7 @@ export class RoomService {
       this.repo.deleteRoom(roomId)
       this.rooms.delete(roomId)
       this.online.delete(roomId)
+      this.shuffleOrders.delete(roomId)
       this.invalidate(roomId)
     })
   }
@@ -252,7 +313,7 @@ export class RoomService {
         if (!this.rooms.has(room.id) || room.playback.revision !== revision) return
         const index = room.queue.findIndex((q) => q.id === room.playback.queueId)
         try {
-          if (index + 1 < room.queue.length) await this.select(room, index + 1)
+          if (room.playbackMode !== 'sequence' || index + 1 < room.queue.length) await this.advance(room, 1)
           else this.pause(room)
         } catch (error) {
           this.pause(room)

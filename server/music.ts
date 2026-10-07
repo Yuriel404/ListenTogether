@@ -141,7 +141,9 @@ export class NeteaseProvider implements MusicProvider {
     const url = new URL(String(item.url))
     if (!['https:', 'http:'].includes(url.protocol)) throw new AppError(502, '网易云返回了无效音频地址')
     url.protocol = 'https:'
-    return { url: url.href, expiresAt: Date.now() + Math.max(30, Math.min(Number(item.expi) || 300, 1200)) * 1000 }
+    const bitrate = Number(item.br)
+    return { url: url.href, expiresAt: Date.now() + Math.max(30, Math.min(Number(item.expi) || 300, 1200)) * 1000,
+      ...(Number.isFinite(bitrate) && bitrate > 0 ? { bitrate } : {}), }
   }
 
   async lyric(id: string, cookie: string | null) { return String((await this.call('lyric', { id }, cookie)).body.lrc?.lyric || '') }

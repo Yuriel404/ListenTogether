@@ -25,7 +25,7 @@ class FakeMusic implements MusicProvider {
   async stream(track: Track, cookie: string, roomId: string) {
     this.streamCalls.push({ roomId, cookie, trackId: track.id })
     if (track.id === this.denyId) throw new AppError(403, '账号只能试听此曲')
-    return { url: `https://audio.example/${roomId}/${track.id}.mp3`, expiresAt: Date.now() + 300000 }
+    return { url: `https://audio.example/${roomId}/${track.id}.mp3?v=${this.streamCalls.length}`, expiresAt: Date.now() + 300000, bitrate: 320000 }
   }
 }
 
@@ -113,13 +113,15 @@ test('仅房主能扫码绑定账号；挑战绑定房间；API 与广播绝不�
   assert.ok(!String(encrypted.encrypted).includes('private-test-cookie'))
 })
 
-test('成员可点歌但不能控制播放；房主操作广播同步，后加入成员得到当前状态', async () => {
+test('成员可点歌、拖动进度和切歌，操作广播同步；播放暂停和管理仍检查房主身份', async () => {
   const owner = await user(), guest = await user(), room = await create(owner)
   await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '朋友' })
   await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=room-owner-cookie' })
   const added = await call(guest, `/rooms/${room.id}/queue`, 'POST', { input: '1' })
   assert.equal(added.status, 200); assert.equal(added.body.queue[0].addedBy, '朋友')
   assert.equal((await call(guest, `/rooms/${room.id}/queue`, 'POST', { input: '1' })).status, 400)
+  const second = await call(guest, `/rooms/${room.id}/queue`, 'POST', { input: '2' })
+  assert.equal((await call(guest, `/rooms/${room.id}/queue/${second.body.queue[1].id}`, 'DELETE')).status, 403)
   const hostSocket = await connect(owner, room.id), guestSocket = await connect(guest, room.id)
   const rejected = await command(guestSocket, { type: 'play' })
   assert.equal(rejected.ok, false)
@@ -132,13 +134,91 @@ test('成员可点歌但不能控制播放；房主操作广播同步，后加�
   assert.ok(state.playback.updatedAt > state.serverTime)
   assert.equal((await call(guest, `/rooms/${room.id}/stream?queueId=${state.playback.queueId}`)).status, 200)
   assert.equal(provider.streamCalls.find((c) => c.roomId === room.id)?.cookie, 'MUSIC_U=room-owner-cookie')
-  const seeked = await command(hostSocket, { type: 'seek', position: 25 })
+  const seekBroadcast = new Promise<RoomSnapshot>((done) => hostSocket.once('room:state', done))
+  const seeked = await command(guestSocket, { type: 'seek', position: 25 })
   assert.ok(seeked.ok && seeked.data.playback.position === 25)
+  assert.equal((await seekBroadcast).playback.position, 25)
   const late = await user()
   const lateState = await call(late, `/rooms/${room.id}/join`, 'POST', { nickname: '后来的人' })
   assert.equal(lateState.body.playback.position, 25)
+  const next = await command(guestSocket, { type: 'next' })
+  assert.ok(next.ok && next.data.playback.queueId === second.body.queue[1].id)
+  const previous = await command(guestSocket, { type: 'previous' })
+  assert.ok(previous.ok && previous.data.playback.queueId === added.body.queue[0].id)
+  const selected = await command(guestSocket, { type: 'select', queueId: second.body.queue[1].id })
+  assert.ok(selected.ok && selected.data.playback.queueId === second.body.queue[1].id)
+  const changes = await Promise.all([command(hostSocket, { type: 'seek', position: 5 }), command(guestSocket, { type: 'seek', position: 15 })])
+  assert.ok(changes[0].ok && changes[1].ok)
+  if (changes[0].ok && changes[1].ok) {
+    assert.equal(Math.abs(changes[0].data.playback.revision - changes[1].data.playback.revision), 1)
+    const latest = changes.sort((a, b) => a.ok && b.ok ? b.data.playback.revision - a.data.playback.revision : 0)[0]
+    assert.ok(latest.ok && (await call(owner, `/rooms/${room.id}`)).body.playback.position === latest.data.playback.position)
+  }
+  assert.equal((await command(guestSocket, { type: 'pause' })).ok, false)
   const paused = await command(hostSocket, { type: 'pause' })
   assert.ok(paused.ok && !paused.data.playback.playing)
+})
+
+test('成员切换播放方式会广播给所有人，保留当前播放基准，后加入成员也同步', async () => {
+  const owner = await user(), guest = await user(), room = await create(owner)
+  await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '播放方式成员' })
+  const host = await connect(owner, room.id), peer = await connect(guest, room.id)
+  const broadcast = new Promise<RoomSnapshot>((done) => {
+    const changed = (state: RoomSnapshot) => { if (state.playbackMode === 'loop') { host.off('room:state', changed); done(state) } }
+    host.on('room:state', changed)
+  })
+  const changed = await command(peer, { type: 'mode', mode: 'loop' })
+  assert.ok(changed.ok)
+  if (!changed.ok) return
+  assert.equal(changed.data.playbackMode, 'loop')
+  assert.deepEqual(changed.data.playback, room.playback)
+  assert.equal((await broadcast).playbackMode, 'loop')
+  const late = await user()
+  assert.equal((await call(late, `/rooms/${room.id}/join`, 'POST', { nickname: '后来加入' })).body.playbackMode, 'loop')
+  for (const payload of [{ type: 'mode' }, { type: 'mode', mode: 'invalid' }]) assert.equal((await command(peer, payload)).ok, false)
+  assert.equal((await call(guest, `/rooms/${room.id}`)).body.playbackMode, 'loop')
+})
+
+test('未登录网易云的成员使用房主解析的同一 CDN 链接，刷新和账号变更使链接缓存失效', async () => {
+  const owner = await user(), guest = await user(), outsider = await user(), room = await create(owner)
+  await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '无需网易云登录' })
+  await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=shared-link-owner' })
+  await call(owner, `/rooms/${room.id}/queue`, 'POST', { input: '1' })
+  const host = await connect(owner, room.id)
+  const played = await command(host, { type: 'play' })
+  assert.ok(played.ok)
+  if (!played.ok) return
+  const queueId = played.data.playback.queueId
+  const [ownStream, peerStream] = await Promise.all([
+    call(owner, `/rooms/${room.id}/stream?queueId=${queueId}`), call(guest, `/rooms/${room.id}/stream?queueId=${queueId}`),
+  ])
+  assert.equal(ownStream.status, 200); assert.equal(peerStream.status, 200)
+  assert.equal(ownStream.body.url, peerStream.body.url)
+  assert.equal(peerStream.body.bitrate, 320000)
+  assert.equal(new URL(peerStream.body.url).hostname, 'audio.example')
+  assert.equal(new URL(peerStream.body.url).pathname, `/${room.id}/1.mp3`)
+  assert.ok(!JSON.stringify(peerStream.body).includes('MUSIC_U'))
+  assert.equal((await call(outsider, `/rooms/${room.id}/stream?queueId=${queueId}`)).status, 403)
+  assert.equal((await fetch(`${base}/api/rooms/${room.id}/stream?queueId=${queueId}`)).status, 401)
+  assert.equal((await call(guest, `/rooms/${room.id}/audio/${queueId}`)).status, 404)
+  const roomCalls = () => provider.streamCalls.filter((call) => call.roomId === room.id)
+  assert.deepEqual(roomCalls(), [{ roomId: room.id, cookie: 'MUSIC_U=shared-link-owner', trackId: '1' }])
+  const refreshed = await call(guest, `/rooms/${room.id}/stream?queueId=${queueId}&refresh=1`)
+  assert.equal(refreshed.status, 200)
+  assert.notEqual(refreshed.body.url, peerStream.body.url)
+  assert.equal(roomCalls().length, 2)
+  assert.equal((await call(owner, `/rooms/${room.id}/stream?queueId=${queueId}`)).body.url, refreshed.body.url)
+  await call(owner, `/rooms/${room.id}/account`, 'DELETE')
+  assert.equal((await call(guest, `/rooms/${room.id}/stream?queueId=${queueId}`)).status, 400)
+  await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=new-link-owner' })
+  assert.equal((await command(host, { type: 'play' })).ok, true)
+  const newStream = await call(guest, `/rooms/${room.id}/stream?queueId=${queueId}`)
+  assert.equal(newStream.status, 200)
+  assert.notEqual(newStream.body.url, refreshed.body.url)
+  assert.equal(roomCalls().length, 3)
+  assert.equal(roomCalls()[2].cookie, 'MUSIC_U=new-link-owner')
+  await call(owner, `/rooms/${room.id}`, 'DELETE')
+  assert.equal((await call(guest, `/rooms/${room.id}/stream?queueId=${queueId}`)).status, 404)
 })
 
 test('Cookie 和音源缓存严格按房间隔离，只有当前歌曲可以获取播放地址', async () => {

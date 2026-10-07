@@ -17,6 +17,7 @@ test('文件数据库重开后可恢复房主身份、歌单、聊天和加密�
   const room = rooms.create(session, '重启测试', '房主')
   await rooms.connectAccount(room.id, session, await provider.account('demo'))
   await rooms.add(room.id, session, '1')
+  await rooms.command(room.id, session, { type: 'mode', mode: 'random' })
   await rooms.command(room.id, session, { type: 'play' })
   rooms.chat(room.id, session, '重启后仍然在')
   first.close()
@@ -27,6 +28,7 @@ test('文件数据库重开后可恢复房主身份、歌单、聊天和加密�
     assert.equal(recovered.owner(room.id, identity).id, room.id)
     assert.equal(recovered.snapshot(room.id).queue[0].track.id, '1')
     assert.equal(recovered.snapshot(room.id).playback.playing, false)
+    assert.equal(recovered.snapshot(room.id).playbackMode, 'random')
     assert.equal(reopened.messages(room.id)[0].text, '重启后仍然在')
     assert.equal(reopened.credential(room.id), 'local-demo')
   } finally {

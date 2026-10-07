@@ -31,9 +31,11 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
   const [position, setPosition] = useState(0)
   const [loading, setLoading] = useState(false)
   const [buffered, setBuffered] = useState(0)
+  const [bitrate, setBitrate] = useState<number | null>(null)
   const [bufferGoal, setGoal] = useState(savedBufferGoal)
   const [error, setError] = useState('')
   const [retry, setRetry] = useState(0)
+  const refreshQueueId = useRef<string | null>(null)
   const loadedId = useRef<string | null>(null)
   const latest = useRef({ room, connected, enabled, blocked, bufferGoal })
   latest.current = { room, connected, enabled, blocked, bufferGoal }
@@ -44,7 +46,7 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     if ((err as { name?: string })?.name === 'NotAllowedError') {
       setBlocked(true); setError('浏览器需要点击授权播放，请点击「开启声音」')
     } else {
-      failed.current = true; setError('音频无法播放，请尝试刷新播放地址')
+      failed.current = true; setError('音频无法播放，请尝试刷新音频')
     }
   }))
 
@@ -73,13 +75,16 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     audio.load()
     loadedId.current = null
     failed.current = false
-    setError(''); setBuffered(0)
+    setError(''); setBuffered(0); setBitrate(null)
+    const refresh = current?.id === refreshQueueId.current
+    refreshQueueId.current = null
     if (!room || !current || !room.account.connected) { setLoading(false); return () => abort.abort() }
     setLoading(true)
-    const path = `/api/rooms/${room.id}/stream?queueId=${current.id}${retry ? '&refresh=1' : ''}`
+    const path = `/api/rooms/${room.id}/stream?queueId=${current.id}${refresh ? '&refresh=1' : ''}`
     void request<StreamInfo>(path, { signal: abort.signal }).then((stream) => {
       if (abort.signal.aborted) return
       loadedId.current = current.id
+      setBitrate(stream.bitrate ?? null)
       audio.src = stream.url
       audio.load()
     }).catch((err) => { if (!abort.signal.aborted) { failed.current = true; setLoading(false); setError(errorText(err)) } })
@@ -97,7 +102,7 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     const failure = () => {
       setLoading(false)
       if (!audio.getAttribute('src')) return
-      if (!failed.current) { failed.current = true; setError('音频加载失败，可尝试刷新播放地址') }
+      if (!failed.current) { failed.current = true; setError('音频加载失败，可尝试刷新音频') }
     }
     const events = ['loadedmetadata', 'canplay', 'canplaythrough', 'progress', 'seeked', 'playing'] as const
     for (const event of events) audio.addEventListener(event, ready)
@@ -172,5 +177,9 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     if (container) container.appendChild(audio)
     else audio.remove()
   }, [audio])
-  return { attach, enabled, blocked, volume, setVolume, toggleVolume, position, loading, buffered, bufferGoal, setBufferGoal, error, unlock, mute, retry: () => setRetry((n) => n + 1) }
+  const retryAudio = useCallback(() => {
+    refreshQueueId.current = latest.current.room?.playback.queueId || null
+    setRetry((n) => n + 1)
+  }, [])
+  return { attach, enabled, blocked, volume, setVolume, toggleVolume, position, loading, buffered, bitrate, bufferGoal, setBufferGoal, error, unlock, mute, retry: retryAudio }
 }

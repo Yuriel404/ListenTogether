@@ -29,6 +29,9 @@ export interface Member {
   online: boolean
 }
 
+export const playbackModes = ['sequence', 'loop', 'random'] as const
+export type PlaybackMode = typeof playbackModes[number]
+
 export interface AccountStatus {
   connected: boolean
   nickname?: string
@@ -44,6 +47,7 @@ export interface RoomSnapshot {
   members: Member[]
   queue: QueueItem[]
   playback: Playback
+  playbackMode: PlaybackMode
   account: AccountStatus
   serverTime: number
 }
@@ -63,9 +67,10 @@ export interface SessionInfo {
 }
 
 export type PlayerCommand = {
-  type: 'play' | 'pause' | 'seek' | 'next' | 'previous' | 'select'
+  type: 'play' | 'pause' | 'seek' | 'next' | 'previous' | 'select' | 'mode'
   queueId?: string
   position?: number
+  mode?: PlaybackMode
 }
 
 export type Ack<T = undefined> = { ok: true; data: T } | { ok: false; error: string }
@@ -73,6 +78,7 @@ export type Ack<T = undefined> = { ok: true; data: T } | { ok: false; error: str
 export interface StreamInfo {
   url: string
   expiresAt: number
+  bitrate?: number
 }
 
 /** position 为秒，歌曲 duration 为毫秒；updatedAt 也可表示尚未到达的计划执行时间。 */

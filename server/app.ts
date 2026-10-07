@@ -5,7 +5,7 @@ import { existsSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { Server } from 'socket.io'
 import { z } from 'zod'
-import type { Ack, PlayerCommand } from '../shared/types.js'
+import { playbackModes, type Ack, type PlayerCommand } from '../shared/types.js'
 import type { Config } from './config.js'
 import { AppError, publicError } from './errors.js'
 import { DemoProvider, NeteaseProvider, synthesizeDemo, type MusicProvider } from './music.js'
@@ -14,7 +14,7 @@ import { RoomService } from './rooms.js'
 
 const nicknameSchema = z.string().trim().min(1, '请填写昵称').max(20, '昵称最多 20 个字符')
 const inputSchema = z.object({ input: z.string().trim().min(1, '请填写链接或歌曲 ID').max(2000) })
-const commandSchema = z.object({ type: z.enum(['play', 'pause', 'seek', 'next', 'previous', 'select']), queueId: z.string().uuid().optional(), position: z.number().finite().min(0).max(86400).optional() })
+const commandSchema = z.object({ type: z.enum(['play', 'pause', 'seek', 'next', 'previous', 'select', 'mode']), queueId: z.string().uuid().optional(), position: z.number().finite().min(0).max(86400).optional(), mode: z.enum(playbackModes).optional() })
 const cookieName = 'listen_session'
 
 function cookieToken(header?: string): string | undefined {
@@ -300,6 +300,7 @@ export function createApplication(config: Config, options: { repository?: Reposi
         const data = commandSchema.parse(input)
         if (data.type === 'seek' && data.position === undefined) throw new AppError(400, '请提供播放位置')
         if (data.type === 'select' && !data.queueId) throw new AppError(400, '请提供队列歌曲')
+        if (data.type === 'mode' && !data.mode) throw new AppError(400, '请选择播放方式')
         ack({ ok: true, data: await rooms.command(roomId, session, data) })
       } catch (error) { ack({ ok: false, error: error instanceof z.ZodError ? '播放指令格式不正确' : publicError(error) }) }
     })
