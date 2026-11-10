@@ -4,6 +4,7 @@ import { errorText, request } from './api'
 import { bufferChoices, BufferedAudioController, defaultBufferGoal } from './audio-sync'
 import { LocalVolumeController } from './audio-volume'
 import { AudioFocus } from './audio-focus'
+import { AudioStreamLoader } from './audio-stream'
 
 function savedBufferGoal(): number {
   try {
@@ -33,7 +34,7 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
   const [buffered, setBuffered] = useState(0)
   const [bufferGoal, setGoal] = useState(savedBufferGoal)
   const [error, setError] = useState('')
-  const [retry, setRetry] = useState(0)
+  const streamLoaderRef = useRef<AudioStreamLoader | null>(null)
   const loadedId = useRef<string | null>(null)
   const latest = useRef({ room, connected, enabled, blocked, bufferGoal })
   latest.current = { room, connected, enabled, blocked, bufferGoal }
@@ -44,9 +45,26 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     if ((err as { name?: string })?.name === 'NotAllowedError') {
       setBlocked(true); setError('浏览器需要点击授权播放，请点击「开启声音」')
     } else {
+      streamLoaderRef.current?.markFailed()
       failed.current = true; setError('音频无法播放，请尝试刷新播放地址')
     }
   }))
+  const [streamLoader] = useState(() => new AudioStreamLoader(
+    (target, refresh, signal) => request<StreamInfo>(`/api/rooms/${target.roomId}/stream?queueId=${target.queueId}${refresh ? '&refresh=1' : ''}`, { signal }),
+    {
+      reset: () => {
+        controller.reset(performance.now())
+        audio.removeAttribute('src'); audio.load()
+        loadedId.current = null; failed.current = false
+        setError(''); setBuffered(0); setLoading(false)
+      },
+      pause: () => { audio.pause(); setLoading(false) },
+      loading: () => setLoading(true),
+      loaded: (stream, target) => { loadedId.current = target.queueId; audio.src = stream.url; audio.load() },
+      error: (err) => { failed.current = true; setLoading(false); setError(errorText(err)) },
+    },
+  ))
+  streamLoaderRef.current = streamLoader
 
   const reconcile = useCallback((align = false) => {
     const { room: state, connected: online, enabled: listening, blocked: autoplayBlocked, bufferGoal: goal } = latest.current
@@ -67,24 +85,13 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
   }, [audio, controller, getServerTime])
 
   useEffect(() => {
-    const abort = new AbortController()
+    streamLoader.update(room && current && room.account.connected ? { roomId: room.id, queueId: current.id } : null, connected)
+  }, [streamLoader, room?.id, current?.id, room?.account.connected, connected])
+  useEffect(() => () => {
+    streamLoader.dispose()
     controller.reset(performance.now())
-    audio.removeAttribute('src')
-    audio.load()
-    loadedId.current = null
-    failed.current = false
-    setError(''); setBuffered(0)
-    if (!room || !current || !room.account.connected) { setLoading(false); return () => abort.abort() }
-    setLoading(true)
-    const path = `/api/rooms/${room.id}/stream?queueId=${current.id}${retry ? '&refresh=1' : ''}`
-    void request<StreamInfo>(path, { signal: abort.signal }).then((stream) => {
-      if (abort.signal.aborted) return
-      loadedId.current = current.id
-      audio.src = stream.url
-      audio.load()
-    }).catch((err) => { if (!abort.signal.aborted) { failed.current = true; setLoading(false); setError(errorText(err)) } })
-    return () => { abort.abort(); controller.reset(performance.now()) }
-  }, [audio, controller, room?.id, current?.id, room?.account.connected, retry])
+    audio.removeAttribute('src'); audio.load()
+  }, [streamLoader, audio, controller])
 
   useEffect(() => {
     // canplay 只表示可继续解码，不应强制 seek，否则会再次触发 waiting。
@@ -97,6 +104,7 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     const failure = () => {
       setLoading(false)
       if (!audio.getAttribute('src')) return
+      streamLoader.markFailed()
       if (!failed.current) { failed.current = true; setError('音频加载失败，可尝试刷新播放地址') }
     }
     const events = ['loadedmetadata', 'canplay', 'canplaythrough', 'progress', 'seeked', 'playing'] as const
@@ -111,7 +119,7 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
       audio.removeEventListener('error', failure)
       audio.pause()
     }
-  }, [audio, controller, reconcile])
+  }, [audio, controller, reconcile, streamLoader])
 
   useEffect(() => {
     const wait = Math.max(0, (room?.playback.updatedAt || 0) - getServerTime())
@@ -172,5 +180,5 @@ export function useRoomAudio(room: RoomSnapshot | null, connected: boolean, getS
     if (container) container.appendChild(audio)
     else audio.remove()
   }, [audio])
-  return { attach, enabled, blocked, volume, setVolume, toggleVolume, position, loading, buffered, bufferGoal, setBufferGoal, error, unlock, mute, retry: () => setRetry((n) => n + 1) }
+  return { attach, enabled, blocked, volume, setVolume, toggleVolume, position, loading, buffered, bufferGoal, setBufferGoal, error, unlock, mute, retry: () => streamLoader.retry() }
 }

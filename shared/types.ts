@@ -1,3 +1,6 @@
+export const MAX_QUEUE_TRACKS = 1000
+export const PLAYLIST_PAGE_SIZE = 200
+
 export interface Track {
   id: string
   title: string

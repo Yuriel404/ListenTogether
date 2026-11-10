@@ -13,6 +13,7 @@ export interface Config {
   secureCookie: boolean
   trustProxy: boolean
   provider: 'netease' | 'demo'
+  roomIdleTtlMs?: number
 }
 
 export function loadConfig(): Config {
@@ -39,11 +40,13 @@ export function loadConfig(): Config {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 无效')
   const provider = process.env.MUSIC_PROVIDER || 'netease'
   if (provider !== 'netease' && provider !== 'demo') throw new Error('MUSIC_PROVIDER 只能是 netease 或 demo')
+  const roomIdleTtlHours = Number(process.env.ROOM_IDLE_TTL_HOURS || 24)
+  if (!Number.isFinite(roomIdleTtlHours) || roomIdleTtlHours <= 0 || roomIdleTtlHours > 720) throw new Error('ROOM_IDLE_TTL_HOURS 必须大于 0 且不超过 720 小时')
   return {
     port, host: process.env.HOST || '0.0.0.0', dataDir,
     credentialKey: key, sessionSecret,
     publicOrigins: (process.env.PUBLIC_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173').split(',').map((s) => s.trim()).filter(Boolean),
     secureCookie: process.env.COOKIE_SECURE === 'true' || (production && process.env.COOKIE_SECURE !== 'false'),
-    trustProxy: process.env.TRUST_PROXY === 'true', provider,
+    trustProxy: process.env.TRUST_PROXY === 'true', provider, roomIdleTtlMs: roomIdleTtlHours * 3600_000,
   }
 }

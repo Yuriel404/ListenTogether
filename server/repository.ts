@@ -14,6 +14,7 @@ export interface StoredRoom {
   ownerSessionId: string
   name: string
   createdAt: number
+  lastActiveAt?: number
   queue: QueueItem[]
   playback: Playback
   account: AccountStatus
@@ -43,6 +44,8 @@ export class Repository {
         id TEXT PRIMARY KEY, room_id TEXT REFERENCES rooms(id) ON DELETE CASCADE, document TEXT NOT NULL, sent_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS messages_room_time ON messages(room_id, sent_at);
+      CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+      CREATE INDEX IF NOT EXISTS members_session ON members(session_id);
     `)
   }
 
@@ -61,6 +64,14 @@ export class Repository {
     const id = createHash('sha256').update(token).digest('hex')
     const row = this.db.prepare('SELECT * FROM sessions WHERE id = ? AND expires_at > ?').get(id, Date.now())
     return row ? { id, publicId: String(row.public_id), nickname: String(row.nickname), expiresAt: Number(row.expires_at) } : null
+  }
+
+  hasActiveSession(sessionId: string, now = Date.now()): boolean {
+    return !!this.db.prepare('SELECT 1 FROM sessions WHERE id = ? AND expires_at > ?').get(sessionId, now)
+  }
+
+  pruneExpiredSessions(now = Date.now()): void {
+    this.db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now)
   }
 
   renameSession(session: Session, nickname: string): void {

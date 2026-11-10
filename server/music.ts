@@ -1,4 +1,4 @@
-import type { AccountStatus, StreamInfo, Track } from '../shared/types.js'
+import { MAX_QUEUE_TRACKS, PLAYLIST_PAGE_SIZE, type AccountStatus, type StreamInfo, type Track } from '../shared/types.js'
 import { AppError } from './errors.js'
 
 export interface AccountInfo {
@@ -126,9 +126,45 @@ export class NeteaseProvider implements MusicProvider {
 
   async playlist(input: string, cookie: string | null) {
     const id = await resolveInput(input, 'playlist')
-    const body = (await this.call('playlist_track_all', { id, limit: 100, offset: 0 }, cookie)).body
-    if (!Array.isArray(body.songs) || !body.songs.length) throw new AppError(404, '歌单为空、不可访问或不存在')
-    return body.songs.slice(0, 100).map(normalizeTrack)
+    const body = (await this.call('playlist_detail', { id }, cookie)).body
+    const playlist = body.playlist
+    if ((body.code != null && body.code !== 200) || !playlist || !Array.isArray(playlist.trackIds)) {
+      throw new AppError(502, '无法完整读取歌单，请检查歌单权限或稍后重试')
+    }
+    const tooLarge = () => new AppError(400, `歌单最多支持 ${MAX_QUEUE_TRACKS} 首，请拆分歌单后导入`)
+    if (Number(playlist.trackCount) > MAX_QUEUE_TRACKS) throw tooLarge()
+    if (Number(playlist.trackCount) > playlist.trackIds.length) {
+      throw new AppError(502, '歌单歌曲列表不完整，请检查歌单权限或稍后重试')
+    }
+    const ids: string[] = []
+    const seen = new Set<string>()
+    for (const track of playlist.trackIds) {
+      const trackId = String(track?.id ?? '')
+      if (!/^[1-9]\d*$/.test(trackId)) throw new AppError(502, '歌单歌曲信息异常，请稍后重试')
+      if (!seen.has(trackId)) { seen.add(trackId); ids.push(trackId) }
+      if (ids.length > MAX_QUEUE_TRACKS) throw tooLarge()
+    }
+    if (!ids.length) throw new AppError(404, '歌单为空、不可访问或不存在')
+
+    // 先获取完整 ID 列表，再分批读取详情；任一批次失败都不返回部分歌单。
+    const tracks: Track[] = []
+    for (let offset = 0; offset < ids.length; offset += PLAYLIST_PAGE_SIZE) {
+      const batch = ids.slice(offset, offset + PLAYLIST_PAGE_SIZE)
+      const detail = (await this.call('song_detail', { ids: batch.join(',') }, cookie)).body
+      if ((detail.code != null && detail.code !== 200) || !Array.isArray(detail.songs)) {
+        throw new AppError(502, '歌单歌曲详情读取失败，本次未导入，请稍后重试')
+      }
+      const songs = new Map<string, Track>()
+      for (const song of detail.songs) {
+        if (song && song.id != null) songs.set(String(song.id), normalizeTrack(song))
+      }
+      for (const trackId of batch) {
+        const track = songs.get(trackId)
+        if (!track) throw new AppError(502, '歌单中部分歌曲无法读取，本次未导入，请检查歌单权限或稍后重试')
+        tracks.push(track)
+      }
+    }
+    return tracks
   }
 
   async stream(track: Track, cookie: string, _roomId: string): Promise<StreamInfo> {

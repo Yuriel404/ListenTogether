@@ -15,6 +15,7 @@ class FakeMusic implements MusicProvider {
   qrCalls = 0
   streamCalls: { roomId: string; cookie: string; trackId: string }[] = []
   denyId = ''
+  streamGates = new Map<string, () => Promise<void>>()
   async qr() { this.qrCalls++; return { key: 'private-upstream-key', image: 'data:image/png;base64,test' } }
   async checkQr(key: string) { assert.equal(key, 'private-upstream-key'); return { status: 803, account: await this.account('MUSIC_U=private-test-cookie') } }
   async account(cookie: string) { return { cookie, nickname: '测试房主', avatarUrl: '', vipType: 10 } }
@@ -24,6 +25,7 @@ class FakeMusic implements MusicProvider {
   lyric(id: string, cookie: string | null) { return this.demo.lyric(id, cookie) }
   async stream(track: Track, cookie: string, roomId: string) {
     this.streamCalls.push({ roomId, cookie, trackId: track.id })
+    await this.streamGates.get(roomId)?.()
     if (track.id === this.denyId) throw new AppError(403, '账号只能试听此曲')
     return { url: `https://audio.example/${roomId}/${track.id}.mp3`, expiresAt: Date.now() + 300000 }
   }
@@ -197,3 +199,92 @@ test('聊天消息广播并持久化，房主关闭房间会删除凭据和成�
   assert.equal(repo.isMember(room.id, repo.findSession(guest.cookie.split('=')[1])!.id), false)
   assert.equal((await call(owner, `/rooms/${room.id}`)).status, 404)
 })
+
+test('房主会话到期自动关闭房间，通知在线成员并释放连接及关联数据', async () => {
+  const owner = await user(), guest = await user(), room = await create(owner)
+  await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '仍在线的朋友' })
+  await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=expired-owner-test' })
+  const host = await connect(owner, room.id), peer = await connect(guest, room.id)
+  const closed = new Promise<void>((done) => peer.once('room:closed', done))
+  const disconnected = new Promise<void>((done) => peer.once('disconnect', () => done()))
+  const hostDisconnected = new Promise<void>((done) => host.once('disconnect', () => done()))
+  const ownerSession = repo.findSession(owner.cookie.split('=')[1])!
+  repo.db.prepare('UPDATE sessions SET expires_at = ? WHERE id = ?').run(Date.now() - 1, ownerSession.id)
+
+  await server.rooms.cleanup()
+  await Promise.all([closed, disconnected, hostDisconnected])
+  assert.equal(server.io.sockets.adapter.rooms.has(room.id), false)
+  assert.equal(server.rooms.rooms.has(room.id), false)
+  assert.equal(repo.credential(room.id), null)
+  assert.equal(repo.db.prepare('SELECT 1 FROM sessions WHERE id = ?').get(ownerSession.id), undefined)
+  assert.equal(repo.isMember(room.id, repo.findSession(guest.cookie.split('=')[1])!.id), false)
+  assert.equal((await call(guest, `/rooms/${room.id}`)).status, 404)
+})
+
+test('房主通过 HTTP 一次清空歌单，WebSocket 广播停止状态，成员及无 CSRF 请求被拒绝', async () => {
+  const owner = await user(), guest = await user(), room = await create(owner)
+  await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '朋友' })
+  await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=clear-queue-test' })
+  await call(guest, `/rooms/${room.id}/playlist`, 'POST', { input: '1' })
+  const host = await connect(owner, room.id), peer = await connect(guest, room.id)
+  const playing = await command(host, { type: 'play' })
+  assert.equal(playing.ok, true)
+  assert.equal((await call(guest, `/rooms/${room.id}/queue`, 'DELETE')).status, 403)
+  assert.equal((await call(owner, `/rooms/${room.id}/queue`, 'DELETE', undefined, { 'x-csrf-token': 'bad' })).status, 403)
+  const broadcast = new Promise<RoomSnapshot>((done) => {
+    const receive = (state: RoomSnapshot) => { if (!state.queue.length) { peer.off('room:state', receive); done(state) } }
+    peer.on('room:state', receive)
+  })
+  const cleared = await call(owner, `/rooms/${room.id}/queue`, 'DELETE')
+  assert.equal(cleared.status, 200)
+  const state = await broadcast
+  assert.deepEqual(state.queue, [])
+  assert.equal(state.playback.queueId, null)
+  assert.equal(state.playback.position, 0)
+  assert.equal(state.playback.playing, false)
+  assert.equal(state.account.connected, true)
+  assert.equal(state.members.length, 2)
+  assert.equal((await call(guest, `/rooms/${room.id}`)).body.queue.length, 0)
+  assert.equal((await call(guest, `/rooms/${room.id}/queue`, 'POST', { input: '2' })).status, 200)
+})
+
+for (const control of ['pause', 'close'] as const) {
+  test(`真实 HTTP 成员慢音源请求不会阻塞房主 ${control}，并发读取只调用一次上游`, async () => {
+    const owner = await user(), guest = await user(), room = await create(owner)
+    await call(guest, `/rooms/${room.id}/join`, 'POST', { nickname: '慢请求成员' })
+    await call(owner, `/rooms/${room.id}/account/cookie`, 'POST', { cookie: 'MUSIC_U=slow-stream-test' })
+    await call(owner, `/rooms/${room.id}/queue`, 'POST', { input: '1' })
+    const host = await connect(owner, room.id)
+    const playing = await command(host, { type: 'play' })
+    assert.ok(playing.ok)
+    const queueId = playing.data.playback.queueId!
+    let release!: () => void, arrive!: () => void, requests = 0, upstreamCalls = 0
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const arrived = new Promise<void>((resolve) => { arrive = resolve })
+    provider.streamGates.set(room.id, async () => { upstreamCalls++; await blocked })
+    const listener = (request: { url?: string }) => {
+      if (request.url?.startsWith(`/api/rooms/${room.id}/stream?`) && ++requests === 3) arrive()
+    }
+    server.http.on('request', listener)
+    const reads = Promise.all(Array.from({ length: 3 }, () => call(guest, `/rooms/${room.id}/stream?queueId=${queueId}&refresh=1`)))
+    try {
+      await arrived
+      server.http.off('request', listener)
+      const result = await Promise.race([
+        control === 'pause' ? command(host, { type: 'pause' }) : call(owner, `/rooms/${room.id}`, 'DELETE'),
+        new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error(`${control} 等待了成员的音源请求`)), 1000); timer.unref() }),
+      ])
+      if ('ok' in result) assert.ok(result.ok)
+      else assert.equal(result.status, 200)
+      assert.equal(upstreamCalls, 1)
+      const state = await call(owner, `/rooms/${room.id}`)
+      if (control === 'pause') assert.equal(state.body.playback.playing, false)
+      else assert.equal(state.status, 404)
+    } finally {
+      release()
+      provider.streamGates.delete(room.id)
+      server.http.off('request', listener)
+    }
+    assert.deepEqual((await reads).map((result) => result.status), [control === 'pause' ? 200 : 404, control === 'pause' ? 200 : 404, control === 'pause' ? 200 : 404])
+  })
+}

@@ -47,12 +47,13 @@ class RateLimiter {
 export function createApplication(config: Config, options: { repository?: Repository; provider?: MusicProvider } = {}) {
   const repo = options.repository || new Repository(join(config.dataDir, 'listen.sqlite'), config.credentialKey)
   const provider = options.provider || (config.provider === 'demo' ? new DemoProvider() : new NeteaseProvider())
-  const rooms = new RoomService(repo, provider)
+  const rooms = new RoomService(repo, provider, { idleTtlMs: config.roomIdleTtlMs })
   const app = express()
   const http = createServer(app)
   const rate = new RateLimiter()
   const sessions = new WeakMap<Request, Session>()
   const challenges = new Map<string, { id: string; key: string; ownerId: string; expiresAt: number; status: number; lastPoll: number; inFlight: boolean }>()
+  const accountOperations = new Map<string, symbol>()
   const demoAudio = new Map<string, Buffer>()
   app.disable('x-powered-by')
   if (config.trustProxy) app.set('trust proxy', 1)
@@ -62,6 +63,15 @@ export function createApplication(config: Config, options: { repository?: Reposi
     const session = sessions.get(req)
     if (!session) throw new AppError(401, '会话已过期，请刷新页面')
     return session
+  }
+  const beginAccountOperation = (roomId: string) => {
+    const token = Symbol()
+    accountOperations.set(roomId, token)
+    challenges.delete(roomId)
+    return () => accountOperations.get(roomId) === token
+  }
+  const requireCurrentAccountOperation = (isCurrent: () => boolean) => {
+    if (!isCurrent()) throw new AppError(409, '账号操作已被更新，请使用最新的登录请求')
   }
   const validOrigin = (origin: string | undefined, host: string | undefined) => {
     if (!origin) return true
@@ -77,6 +87,12 @@ export function createApplication(config: Config, options: { repository?: Reposi
   })
   rooms.onChange = (snapshot) => io.to(snapshot.id).emit('room:state', snapshot)
   rooms.onError = (id, message) => io.to(id).emit('room:error', message)
+  rooms.onClose = (id) => {
+    challenges.delete(id)
+    accountOperations.delete(id)
+    io.to(id).emit('room:closed')
+    io.in(id).disconnectSockets(true)
+  }
 
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -162,6 +178,9 @@ export function createApplication(config: Config, options: { repository?: Reposi
   app.delete('/api/rooms/:id/queue/:queueId', async (req, res) => {
     res.json(await rooms.remove(String(req.params.id), sessionFor(req), String(req.params.queueId)))
   })
+  app.delete('/api/rooms/:id/queue', async (req, res) => {
+    res.json(await rooms.clearQueue(String(req.params.id), sessionFor(req)))
+  })
   app.get('/api/rooms/:id/stream', async (req, res) => {
     const queueId = z.string().uuid().parse(req.query.queueId)
     if (req.query.refresh === '1') rate.check(`refresh:${sessionFor(req).id}`, 5)
@@ -182,8 +201,10 @@ export function createApplication(config: Config, options: { repository?: Reposi
     const id = String(req.params.id), session = sessionFor(req)
     rooms.owner(id, session)
     rate.check(`qr:${session.id}`, 10)
+    const isCurrent = beginAccountOperation(id)
     const result = await provider.qr()
     rooms.owner(id, session)
+    requireCurrentAccountOperation(isCurrent)
     const challenge = { id: randomUUID(), key: result.key, ownerId: session.id, expiresAt: Date.now() + 180_000, status: 801, lastPoll: 0, inFlight: false }
     challenges.set(id, challenge)
     res.json({ requestId: challenge.id, image: result.image, expiresAt: challenge.expiresAt })
@@ -196,6 +217,8 @@ export function createApplication(config: Config, options: { repository?: Reposi
     if (!challenge || challenge.id !== req.params.requestId || challenge.ownerId !== session.id || challenge.expiresAt < Date.now()) {
       res.json({ status: 800 }); return
     }
+    const operation = accountOperations.get(id)
+    const isCurrent = () => accountOperations.get(id) === operation && challenges.get(id) === challenge && challenge.expiresAt >= Date.now()
     if (challenge.status === 803 || challenge.inFlight || Date.now() - challenge.lastPoll < 1500) {
       res.json({ status: challenge.status }); return
     }
@@ -203,10 +226,15 @@ export function createApplication(config: Config, options: { repository?: Reposi
     challenge.lastPoll = Date.now()
     try {
       const result = await provider.checkQr(challenge.key)
-      if (challenges.get(id) !== challenge) { res.json({ status: 800 }); return }
-      if (result.status === 803 && result.account) await rooms.connectAccount(id, session, result.account)
+      rooms.owner(id, session)
+      if (!isCurrent()) { res.json({ status: 800 }); return }
+      if (result.status === 803 && result.account) await rooms.connectAccount(id, session, result.account, isCurrent)
+      if (!isCurrent()) { res.json({ status: 800 }); return }
       challenge.status = result.status
       res.json({ status: challenge.status })
+    } catch (error) {
+      if (error instanceof AppError && error.status === 409 && !isCurrent()) { res.json({ status: 800 }); return }
+      throw error
     } finally { challenge.inFlight = false }
   })
 
@@ -216,29 +244,32 @@ export function createApplication(config: Config, options: { repository?: Reposi
     if (provider.mode === 'demo') throw new AppError(400, '演示模式不接收真实网易云凭据')
     rate.check(`cookie:${session.id}`, 8)
     const cookie = z.string().trim().min(10).max(8000).parse(req.body?.cookie)
+    const isCurrent = beginAccountOperation(id)
     const account = await provider.account(cookie)
-    challenges.delete(id)
-    res.json(await rooms.connectAccount(id, session, account))
+    rooms.owner(id, session)
+    requireCurrentAccountOperation(isCurrent)
+    res.json(await rooms.connectAccount(id, session, account, isCurrent))
   })
   app.post('/api/rooms/:id/account/demo', async (req, res) => {
     const id = String(req.params.id), session = sessionFor(req)
     rooms.owner(id, session)
     if (provider.mode !== 'demo') throw new AppError(404, '真实模式未启用演示登录')
-    res.json(await rooms.connectAccount(id, session, await provider.account('local-demo')))
+    const isCurrent = beginAccountOperation(id)
+    const account = await provider.account('local-demo')
+    rooms.owner(id, session)
+    requireCurrentAccountOperation(isCurrent)
+    res.json(await rooms.connectAccount(id, session, account, isCurrent))
   })
   app.delete('/api/rooms/:id/account', async (req, res) => {
     const id = String(req.params.id)
     rooms.owner(id, sessionFor(req))
-    challenges.delete(id)
+    beginAccountOperation(id)
     res.json(await rooms.disconnectAccount(id, sessionFor(req)))
   })
 
   app.delete('/api/rooms/:id', async (req, res) => {
     const id = String(req.params.id)
     await rooms.close(id, sessionFor(req))
-    challenges.delete(id)
-    io.to(id).emit('room:closed')
-    io.in(id).disconnectSockets(true)
     res.json({ ok: true })
   })
 
@@ -336,17 +367,24 @@ export function createApplication(config: Config, options: { repository?: Reposi
 
   const tick = setInterval(() => rooms.tick(), 500)
   const sync = setInterval(() => {
-    for (const id of rooms.rooms.keys()) if (io.sockets.adapter.rooms.has(id)) io.to(id).emit('room:state', rooms.snapshot(id))
+    for (const id of io.sockets.adapter.rooms.keys()) if (rooms.rooms.has(id)) io.to(id).emit('room:state', rooms.snapshot(id))
   }, 5000)
   const cleanup = setInterval(() => {
     rate.prune()
     for (const [id, value] of challenges) if (value.expiresAt < Date.now()) challenges.delete(id)
+    for (const socket of io.sockets.sockets.values()) {
+      if ((socket.data.session as Session).expiresAt <= Date.now()) socket.disconnect(true)
+    }
+    void rooms.cleanup().catch((error: unknown) => {
+      console.error('房间清理失败:', error instanceof Error ? error.name : 'UnknownError')
+    })
   }, 60_000)
   tick.unref(); sync.unref(); cleanup.unref()
 
   const close = async () => {
     clearInterval(tick); clearInterval(sync); clearInterval(cleanup)
     await new Promise<void>((done) => io.close(() => done()))
+    await rooms.drain()
     repo.close()
   }
   return { app, http, io, rooms, repo, close }

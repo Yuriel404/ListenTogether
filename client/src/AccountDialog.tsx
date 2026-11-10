@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { CheckCircle2, LogOut, QrCode, RefreshCw, ShieldCheck } from 'lucide-react'
 import type { RoomSnapshot } from '../../shared/types'
 import { errorText, post, request } from './api'
@@ -10,24 +10,37 @@ export function AccountDialog({ room, onClose, notify }: { room: RoomSnapshot; o
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [cookie, setCookie] = useState('')
+  const generation = useRef(0)
+  const active = useRef(true)
   const base = `/api/rooms/${room.id}/account`
   const generate = async () => {
+    const current = ++generation.current
+    const isCurrent = () => active.current && generation.current === current
     setLoading(true); setError(''); setQr(null); setStatus(801)
-    try { setQr(await post(`${base}/qr`)) } catch (err) { setError(errorText(err)) } finally { setLoading(false) }
+    try {
+      const result = await post<{ requestId: string; image: string }>(`${base}/qr`)
+      if (isCurrent()) setQr(result)
+    } catch (err) { if (isCurrent()) setError(errorText(err)) }
+    finally { if (isCurrent()) setLoading(false) }
   }
-  useEffect(() => { if (!room.account.connected && room.account.mode === 'netease') void generate() }, [])
+  useEffect(() => {
+    active.current = true
+    if (!room.account.connected && room.account.mode === 'netease') void generate()
+    return () => { active.current = false; generation.current++ }
+  }, [base])
   useEffect(() => {
     if (!qr) return
+    const current = generation.current
     let active = true, timer: ReturnType<typeof setTimeout>, failures = 0
     const poll = async () => {
       try {
         const result = await post<{ status: number }>(`${base}/qr/${qr.requestId}/check`)
-        if (!active) return
+        if (!active || generation.current !== current) return
         failures = 0; setError(''); setStatus(result.status)
         if (result.status === 803) { notify('网易云账号已连接'); onClose(); return }
         if (result.status === 800) return
       } catch (err) {
-        if (!active) return
+        if (!active || generation.current !== current) return
         setError(errorText(err)); failures++
         if (failures >= 3) { setStatus(800); return }
       }
@@ -42,7 +55,7 @@ export function AccountDialog({ room, onClose, notify }: { room: RoomSnapshot; o
     catch (err) { setError(errorText(err)) } finally { setLoading(false) }
   }
   const connectCookie = async (event: FormEvent) => {
-    event.preventDefault(); setLoading(true); setError('')
+    event.preventDefault(); generation.current++; setQr(null); setLoading(true); setError('')
     try { await post(`${base}/cookie`, { cookie }); notify('网易云账号已连接'); onClose() }
     catch (err) { setError(errorText(err)) } finally { setCookie(''); setLoading(false) }
   }
