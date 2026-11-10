@@ -27,7 +27,7 @@ test('播放时间按服务端基准计算，处理延迟执行、暂停、进�
 
 test('Cookie 使用 AES-GCM 加密，并绑定房间；密文不能跨房间复用', () => {
   const repo = new Repository(':memory:', randomBytes(32))
-  const base = { ownerSessionId: 'owner', name: 'test', createdAt: 0, queue: [], playback: { queueId: null, playing: false, position: 0, updatedAt: 0, revision: 0 }, account: { connected: false, mode: 'netease' as const }, passwordHash: null }
+  const base = { ownerSessionId: 'owner', name: 'test', createdAt: 0, queue: [], playback: { queueId: null, playing: false, position: 0, updatedAt: 0, revision: 0 }, playbackMode: 'sequence' as const, account: { connected: false, mode: 'netease' as const }, passwordHash: null }
   repo.saveRoom({ ...base, id: 'room-a' }); repo.saveRoom({ ...base, id: 'room-b' })
   repo.setCredential('room-a', 'MUSIC_U=only-for-test')
   const row = repo.db.prepare('SELECT encrypted FROM credentials WHERE room_id = ?').get('room-a')!

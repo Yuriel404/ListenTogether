@@ -97,18 +97,67 @@ test('歌曲末尾以实际剩余长度为缓冲目标，暂停和停止收听�
   assert.equal(audio.plays, 1)
 })
 
-test('时钟小幅误差采用平缓变速，用户拖动进度只触发一次跳转，seek 的 waiting 不引发重缓冲循环', () => {
+test('小幅时间偏差保持原速，用户拖动进度只触发一次跳转，seek 的 waiting 不引发重缓冲循环', () => {
   const audio = new FakeAudio(), controller = new BufferedAudioController(audio)
   controller.reset(0); controller.sync(input())
-  assert.equal(controller.sync(input(1.2, 500)).buffering, false)
+  assert.equal(controller.sync(input(0.4, 500)).buffering, false)
   assert.equal(audio.seeks.length, 0)
-  assert.equal(audio.playbackRate, 1.02)
+  assert.equal(audio.playbackRate, 1)
   controller.sync({ ...input(80, 1000), align: true })
   controller.waiting(1000) // seek 过程的 waiting 应忽略。
   audio.settle()
   assert.equal(controller.sync(input(80.1, 1100)).buffering, false)
   assert.equal(controller.sync(input(80.1, 1200)).buffering, false)
   assert.deepEqual(audio.seeks, [80])
+})
+
+test('半秒以内的长期偏差始终保持原速，不自动跳转', () => {
+  for (const offset of [-0.4, 0.4]) {
+    const audio = new FakeAudio(), controller = new BufferedAudioController(audio)
+    controller.reset(0); controller.sync(input())
+    for (let second = 1; second <= 60; second++) {
+      audio.advance(1)
+      assert.equal(controller.sync(input(second + offset, second * 1000)).buffering, false)
+      assert.equal(audio.playbackRate, 1)
+    }
+    assert.equal(audio.seeks.length, 0)
+    assert.equal(audio.plays, 1)
+  }
+})
+
+test('较大偏差持续 3 秒后仅校正一次，短暂时钟波动不会触发跳转', () => {
+  for (const offset of [-1, 1]) {
+    const audio = new FakeAudio(), controller = new BufferedAudioController(audio)
+    controller.reset(0); controller.sync(input())
+    audio.advance(5)
+    controller.sync(input(5 + offset, 5000))
+    controller.sync(input(5 + offset, 7000))
+    assert.equal(audio.seeks.length, 0)
+    controller.sync(input(5.1, 7500)) // 短暂偏差恢复，重新计算持续时间。
+    controller.sync(input(5 + offset, 8000))
+    controller.sync(input(5 + offset, 10999))
+    assert.equal(audio.seeks.length, 0)
+    controller.sync(input(5 + offset, 11000))
+    assert.deepEqual(audio.seeks, [5 + offset])
+    audio.settle()
+    controller.sync(input(5 + offset, 11100))
+    assert.equal(audio.playbackRate, 1)
+    assert.equal(audio.paused, false)
+  }
+})
+
+test('自动校正之间至少间隔 8 秒；外部进度操作仍即时校正', () => {
+  const audio = new FakeAudio(), controller = new BufferedAudioController(audio)
+  controller.reset(0); controller.sync(input())
+  controller.sync(input(3, 1000)); controller.sync(input(3, 4000)); audio.settle()
+  controller.sync(input(6, 5000)); controller.sync(input(6, 8000)); controller.sync(input(6, 11999))
+  assert.deepEqual(audio.seeks, [3])
+  controller.sync(input(6, 12000)); audio.settle()
+  assert.deepEqual(audio.seeks, [3, 6])
+  controller.sync({ ...input(80, 12500), align: true }); audio.settle()
+  controller.sync(input(80, 12600))
+  assert.deepEqual(audio.seeks, [3, 6, 80])
+  assert.equal(audio.playbackRate, 1)
 })
 
 test('没有目标位置缓存时最多每 8 秒重新定位一次，防止网络差时不停截断下载', () => {

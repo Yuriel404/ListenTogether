@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
-import type { AccountStatus, ChatMessage, Playback, QueueItem } from '../shared/types.js'
+import type { AccountStatus, ChatMessage, Playback, PlaybackMode, QueueItem } from '../shared/types.js'
 
 export interface Session {
   id: string
@@ -17,6 +17,7 @@ export interface StoredRoom {
   lastActiveAt?: number
   queue: QueueItem[]
   playback: Playback
+  playbackMode: PlaybackMode
   account: AccountStatus
   passwordHash: string | null
 }

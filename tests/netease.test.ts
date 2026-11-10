@@ -9,7 +9,7 @@ test('全新 SDK 模块进程无 xeapi 公钥时仍可播放，多个房间的�
       // 模拟新版 SDK：默认 xeapi 在未运行 CLI 初始化时会直接抛错。
       if (params.crypto !== 'eapi') throw new Error('xeapi public key is missing')
       cookies.push(params.cookie)
-      return { body: { data: [{ url: 'https://music.example/full.mp3', freeTrialInfo: null, expi: 120 }] } }
+      return { body: { data: [{ url: 'https://music.example/full.mp3', freeTrialInfo: null, expi: 120, br: 320000 }] } }
     },
   })
   const streams = await Promise.all([
@@ -17,6 +17,7 @@ test('全新 SDK 模块进程无 xeapi 公钥时仍可播放，多个房间的�
     provider.stream(demoTracks[0], 'MUSIC_U=room-b', 'room-b'),
   ])
   assert.equal(streams.length, 2)
+  assert.equal(streams[0].bitrate, 320000)
   assert.deepEqual(cookies.sort(), ['MUSIC_U=room-a', 'MUSIC_U=room-b'])
 })
 

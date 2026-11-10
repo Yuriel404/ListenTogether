@@ -77,6 +77,7 @@ test('队列可容纳 1000 首；并发导入在提交时检查容量，失败�
 test('仅房主可清空，清空会停止播放并持久化，保留账号、成员与聊天', async (t) => {
   const { repo, rooms, owner, guest, id } = await playable(t)
   rooms.chat(id, guest, '保留聊天')
+  await rooms.command(id, guest, { type: 'mode', mode: 'random' })
   await rooms.command(id, owner, { type: 'seek', position: 20 })
   const before = rooms.snapshot(id)
   assert.equal(cache(rooms).size, 1)
@@ -88,6 +89,7 @@ test('仅房主可清空，清空会停止播放并持久化，保留账号、�
   assert.equal(cleared.playback.playing, false)
   assert.equal(cleared.playback.position, 0)
   assert.ok(cleared.playback.revision > before.playback.revision)
+  assert.equal(cleared.playbackMode, 'random')
   assert.deepEqual(cleared.account, before.account)
   assert.deepEqual(cleared.members, before.members)
   assert.equal(repo.messages(id)[0].text, '保留聊天')

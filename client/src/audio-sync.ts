@@ -47,6 +47,7 @@ export class BufferedAudioController {
   private lastSeek = -Infinity
   private playPending = false
   private generation = 0
+  private driftSince: number | null = null
 
   constructor(private audio: AudioOutput, private onPlayError: (error: unknown) => void = () => {}) {}
 
@@ -57,8 +58,9 @@ export class BufferedAudioController {
     this.alignPending = true
     this.bufferSince = now
     this.lastSeek = -Infinity
+    this.driftSince = null
     this.audio.pause()
-    this.audio.playbackRate = 1
+    this.normalSpeed()
   }
 
   waiting(now: number): void {
@@ -70,8 +72,14 @@ export class BufferedAudioController {
   private enterBuffering(now: number): void {
     if (!this.buffering) this.bufferSince = now
     this.buffering = true
+    this.driftSince = null
     this.audio.pause()
-    this.audio.playbackRate = 1
+    this.normalSpeed()
+  }
+
+  private normalSpeed(): void {
+    // 始终使用原速，且不重复写入相同速率，避免触发浏览器的变速处理。
+    if (this.audio.playbackRate !== 1) this.audio.playbackRate = 1
   }
 
   private seek(position: number, now: number): void {
@@ -90,16 +98,17 @@ export class BufferedAudioController {
 
   sync(input: SyncInput): { buffering: boolean; buffered: number } {
     const audio = this.audio
+    this.normalSpeed()
     const duration = Math.min(input.duration || Infinity, Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : Infinity)
     const target = Math.min(duration, Math.max(0, input.position))
     const remaining = Math.max(0, duration - target)
     const ahead = bufferedSeconds(audio.buffered, target)
     const status = (buffering: boolean) => ({ buffering, buffered: ahead })
 
-    if (!input.active) { audio.pause(); audio.playbackRate = 1; return status(false) }
-    if (!input.executeReady) return status(this.buffering)
+    if (!input.active) { audio.pause(); this.driftSince = null; return status(false) }
+    if (!input.executeReady) { this.driftSince = null; return status(this.buffering) }
     if (!input.playing || remaining <= 0.05) {
-      audio.pause(); audio.playbackRate = 1
+      audio.pause(); this.driftSince = null
       this.buffering = true
       this.bufferSince = input.now
       if (input.align && audio.readyState >= 1 && !audio.seeking) this.seek(target, input.now)
@@ -131,20 +140,21 @@ export class BufferedAudioController {
       }
       this.buffering = false
       this.seek(target, input.now)
-      audio.playbackRate = 1
+      this.driftSince = null
       this.play()
       return status(false)
     }
 
     const drift = target - audio.currentTime
-    // 只有明显偏离且目标已缓存时才硬校正，微小误差用平缓变速吸收。
-    if (Math.abs(drift) > 2 && input.now - this.lastSeek >= 8000) {
-      if (ahead < Math.min(5, remaining)) { this.enterBuffering(input.now); this.seek(target, input.now); return status(true) }
-      this.seek(target, input.now)
-      audio.playbackRate = 1
-    } else {
-      const rate = Math.abs(drift) > 0.15 ? Math.max(0.98, Math.min(1.02, 1 + drift * 0.02)) : 1
-      if (Math.abs(audio.playbackRate - rate) > 0.002) audio.playbackRate = rate
+    // 容忍半秒偏差；持续 3 秒明显不同步时才跳转，并限制自动跳转频率。
+    if (Math.abs(drift) <= 0.5) this.driftSince = null
+    else {
+      this.driftSince ??= input.now
+      if (input.now - this.driftSince >= 3000 && input.now - this.lastSeek >= 8000) {
+        if (ahead < Math.min(5, remaining)) { this.enterBuffering(input.now); this.seek(target, input.now); return status(true) }
+        this.seek(target, input.now)
+        this.driftSince = null
+      }
     }
     this.play()
     return status(false)
