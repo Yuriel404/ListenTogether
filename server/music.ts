@@ -63,6 +63,22 @@ async function resolveInput(input: string, kind: 'song' | 'playlist'): Promise<s
 type ApiResult = { body: Record<string, any>; cookie?: string[] }
 type Api = Record<string, (params: Record<string, unknown>) => Promise<ApiResult>>
 
+// SDK 有时直接返回业务码，有时以 { status, body } 拒绝请求。错误正文可能含凭据。
+function playbackRequestError(error: unknown): AppError {
+  const failure = error as { status?: number; code?: unknown; message?: unknown; body?: { code?: unknown; msg?: unknown } } | null
+  const reason = failure?.body?.msg ?? failure?.message
+  if (failure?.code === 'ETIMEDOUT' || failure?.code === 'ECONNABORTED' ||
+      (typeof reason === 'string' && /timeout|timed? out/i.test(reason))) {
+    return new AppError(504, '获取网易云播放地址超时，请稍后重试')
+  }
+  const code = Number(failure?.body?.code ?? failure?.status)
+  if (code === 301 || code === 401) return new AppError(401, '网易云登录已过期，请让房主重新登录')
+  if (code === 429) return new AppError(429, '网易云播放请求过于频繁（429），请稍后重试')
+  if (code === -460 || code === 403) return new AppError(403, `网易云拒绝了本次播放请求（${code}）`)
+  const detail = Number.isSafeInteger(code) ? `（${code}）` : ''
+  return new AppError(502, `获取网易云播放地址失败${detail}，请稍后重试`)
+}
+
 export class NeteaseProvider implements MusicProvider {
   readonly mode = 'netease' as const
   private apiPromise?: Promise<Api>
@@ -82,7 +98,8 @@ export class NeteaseProvider implements MusicProvider {
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Upstream timeout')), 12000) }),
       ])
       return result
-    } catch {
+    } catch (error) {
+      if (name === 'song_url_v1') throw playbackRequestError(error)
       throw new AppError(502, '网易云请求失败，请稍后重试或让房主重新登录')
     } finally {
       if (timer) clearTimeout(timer)
@@ -168,10 +185,11 @@ export class NeteaseProvider implements MusicProvider {
   }
 
   async stream(track: Track, cookie: string, _roomId: string): Promise<StreamInfo> {
-    // SDK 4.41 将默认协议改为 xeapi，模块模式缺少 CLI 初始化的公钥，且注册接口当前不可用。
-    // 显式使用同一网易云接口支持的 eapi；仍传入本房间凭据并校验完整播放权限。
-    const body = (await this.call('song_url_v1', { id: track.id, level: 'exhigh', crypto: 'eapi' }, cookie)).body
-    const item = body.data?.[0]
+    // 房间采用网页登录，使用同一网页登录态向网易云请求播放地址。
+    const body = (await this.call('song_url_v1', { id: track.id, level: 'exhigh', crypto: 'weapi' }, cookie)).body
+    if (body?.code != null && Number(body.code) !== 200) throw playbackRequestError({ body })
+    const item = body?.data?.[0]
+    if (item?.code != null && Number(item.code) !== 200) throw playbackRequestError({ body: item })
     if (!item?.url) throw new AppError(403, '房主账号暂时无法播放这首歌，请检查登录和歌曲权限')
     if (item.freeTrialInfo && item.freeTrialInfo !== 'null') throw new AppError(403, '当前账号仅能试听这首歌，请选择可完整播放的歌曲')
     const url = new URL(String(item.url))

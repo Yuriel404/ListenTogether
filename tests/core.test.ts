@@ -64,7 +64,7 @@ test('网易云适配层拒绝空音频地址及试听片段，不启用其他�
   assert.equal(captured.cookie, 'MUSIC_U=test')
   assert.equal(captured.unblock, 'false')
   assert.equal(captured.level, 'exhigh')
-  assert.equal(captured.crypto, 'eapi')
+  assert.equal(captured.crypto, 'weapi')
 })
 
 test('演示 WAV 包含合法头部、准确时长与非静音采样', () => {
